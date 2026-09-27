@@ -315,6 +315,14 @@ class GatewayWireProfile:
     pre-serialized body the data plane must send verbatim, and the resolved
     client exposes ``sign_gateway_dispatch``."""
 
+    omits_output_token_limit: bool = False
+    """Whether this rung's payload must carry no output-token ceiling.
+
+    The ChatGPT plan backend rejects ``max_output_tokens`` outright (400
+    "Unsupported parameter"). A ceiling is caller authority, so a request that
+    carries one narrows the plan rung out at admission (the route keeps any
+    API-key rung that honors it) and the payload never carries the field."""
+
     embeddings_url: str | None = None
     """Full OpenAI-wire ``/embeddings`` endpoint for this connection, sharing
     ``headers``; ``None`` when the connection speaks no embeddings wire, so the
