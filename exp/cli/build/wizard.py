@@ -22,6 +22,7 @@ from exp.cli.build.providers import (
 from exp.cli.build.providers import (
     require_replay_role_overrides as _require_replay_role_overrides,
 )
+from exp.cli.build.source import project_for_build
 from exp.cli.build.traces import load_build_traces
 from exp.cli.build.wizard_screens import (
     WizardBuildPlan,
@@ -231,6 +232,7 @@ def run_build_wizard(
                 estimate=plan.build_estimate_usd,
                 maximum_build_cost_usd=max(maximum_build_cost_usd, build_estimate or 0.0),
                 provider_spend_authorized=True,
+                trace_import_id=plan.trace_import_id,
                 progress=progress,
             )
     else:
@@ -452,7 +454,7 @@ def _completed_replay(
         ValueError: Existing immutable router evidence is corrupt or ambiguous.
     """
     store = ProjectStore(root, project)
-    if not store.paths.project_toml.exists():
+    if not store.exists():
         return None
     state = read_review_state(store)
     if state is None:
@@ -509,13 +511,12 @@ def _prepare_new_build(
     """
     from exp.cli.build.app import (
         _embedding_cost_ceiling,
-        _project_store,
         _reuse_completed_grounded_artifacts,
         _selected_roles,
         _validated_role_snapshots,
     )
 
-    normalized = load_build_traces(project, root=root, path=trace_path, source=source)
+    normalized, import_id = load_build_traces(project, root=root, path=trace_path, source=source)
     catalog = _configure_build_providers(
         root,
         project,
@@ -535,11 +536,12 @@ def _prepare_new_build(
     world_snapshot, embedder_snapshot, embedder_capabilities = _validated_role_snapshots(
         runtime, selected
     )
-    store = _project_store(
+    store = project_for_build(
         root,
         ProjectConfig(
             project_id=project,
             trace_source=source,
+            trace_import_id=import_id,
             models=selected,
             retrieval=ProjectRetrievalConfiguration(top_k=top_k),
             budgets=ProjectBudgetConfiguration(
@@ -564,6 +566,7 @@ def _prepare_new_build(
     tasks = completed.artifacts.mining.tasks
     return WizardBuildPlan(
         trace_path=trace_path,
+        trace_import_id=import_id,
         source=source,
         catalog=catalog,
         selected=selected,
@@ -599,7 +602,7 @@ def _completed_build_plan(
         Verified completed-build plan, or ``None`` before grounded selection.
     """
     store = ProjectStore(root, project)
-    if not store.paths.project_toml.exists() or not store.model_catalog_path.exists():
+    if not store.exists() or not store.model_catalog_path.exists():
         return None
     config = store.load_project()
     if config.build is None or config.models is None or config.trace_source is None:
@@ -617,6 +620,7 @@ def _completed_build_plan(
     tasks = load_task_set(store.artifacts, config.build.task_set.artifact_id).tasks
     return WizardBuildPlan(
         trace_path=None,
+        trace_import_id=config.trace_import_id,
         source=config.trace_source,
         catalog=catalog,
         selected=selected,
