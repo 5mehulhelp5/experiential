@@ -82,6 +82,12 @@ pub(super) async fn run_attempt(
                 };
             }
         };
+    // A gateway-chosen cache the provider refuses (expired early, evicted, a
+    // stale resource) re-dials the same rung on its plain wire: the successor
+    // is a reactive repair, which never prepares a cache.
+    let automatic_overlay = cached_wire
+        .as_ref()
+        .is_some_and(|cached| cached.automatic_cache);
     let wire = cached_wire.as_ref().unwrap_or(wire);
     // The connection's raw timeout paces each BODY chunk read, exactly like
     // the python streaming path. The open (request/response-header) phase is
@@ -146,6 +152,13 @@ pub(super) async fn run_attempt(
                 if repair.repair_after(&failure) {
                     return AttemptEnd::Repair {
                         failure,
+                        usage: None,
+                        tool_names: Vec::new(),
+                    };
+                }
+                if automatic_overlay && google_cache::plain_redial_after(&failure) {
+                    return AttemptEnd::Repair {
+                        failure: google_cache::overlay_refusal(failure),
                         usage: None,
                         tool_names: Vec::new(),
                     };
