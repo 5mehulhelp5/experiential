@@ -22,6 +22,7 @@ from exp.common.models import (
 from exp.runtime.models.credentials import DispatchCredentialReceipt
 from exp.runtime.models.providers.async_transport import (
     AsyncJsonHttpTransport,
+    ProviderDeadlineExceeded,
     RequestDeadline,
     as_async_transport,
     post_json_async,
@@ -38,6 +39,8 @@ from exp.runtime.models.providers.transport import (
     RetryClassification,
     RetryPolicy,
     classify_retry,
+    is_unbilled_attempt,
+    propagate_request_attempt_evidence,
 )
 
 if TYPE_CHECKING:
@@ -553,19 +556,25 @@ class ProviderHttpClient(abc.ABC):
         request_headers["Idempotency-Key"] = idempotency_key or f"exp-{uuid4().hex}"
 
         attempts = 0
+        unbilled_attempts = 0
 
         async def attempt(timeout_seconds: float) -> ModelResponse:
             """Send and parse one provider attempt under its remaining time bound."""
-            nonlocal attempts
+            nonlocal attempts, unbilled_attempts
             attempts += 1
             started_at = time.monotonic()
-            response = await self._transport.post(
-                url,
-                headers=request_headers,
-                payload=payload,
-                timeout_seconds=timeout_seconds,
-            )
+            try:
+                response = await self._transport.post(
+                    url,
+                    headers=request_headers,
+                    payload=payload,
+                    timeout_seconds=timeout_seconds,
+                )
+            except ProviderTransportError as error:
+                unbilled_attempts += int(is_unbilled_attempt(error))
+                raise
             if not 200 <= response.status_code < 300:
+                unbilled_attempts += int(response.known_unbilled)
                 error = response.body.get("error")
                 if (
                     idempotency_key is None
@@ -579,6 +588,8 @@ class ProviderHttpClient(abc.ABC):
                 raise ProviderTransportError(
                     f"provider returned HTTP {response.status_code}",
                     status_code=response.status_code,
+                    retry_after_seconds=response.retry_after_seconds,
+                    known_unbilled=response.known_unbilled,
                 )
             try:
                 return self._parse_response(
@@ -600,7 +611,9 @@ class ProviderHttpClient(abc.ABC):
         )
         return result.model_copy(
             update={
-                "economics": result.economics.model_copy(update={"provider_attempts": attempts})
+                "economics": result.economics.model_copy(
+                    update={"provider_attempts": attempts, "unbilled_attempts": unbilled_attempts}
+                )
             }
         )
 
@@ -741,5 +754,14 @@ async def _wait_for[ResultT](
     Returns:
         The provider result before timeout.
     """
-    async with asyncio.timeout(timeout_seconds):
-        return await operation
+    timeout = asyncio.timeout(timeout_seconds)
+    try:
+        async with timeout:
+            return await operation
+    except TimeoutError as error:
+        if not timeout.expired():
+            raise
+        failure = ProviderDeadlineExceeded("provider request deadline exceeded")
+        if isinstance(error.__cause__, asyncio.CancelledError):
+            propagate_request_attempt_evidence(error.__cause__, failure)
+        raise failure from error
