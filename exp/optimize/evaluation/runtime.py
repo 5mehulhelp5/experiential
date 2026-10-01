@@ -54,8 +54,9 @@ def run_prepared_model_evaluation(
         project: Owner of the completed scenario, world-model and judge evidence.
         prepared: Exact engine preparation whose quote the user accepted.
         catalog: Runtime catalog holding transient provider credential references.
-        budget: Approved total provider allowance and judgment count. Raising only the
+        budget: Optional total provider allowance and finite judgment count. Changing only the
             allowance resumes the same plan and replays completed provider responses for free.
+            None removes the aggregate cap while preserving finite request reservations.
         provider_spend_consented: Explicit consent after the host's atomic credit reservation.
         created_at: Stable run timestamp.
         code_revision: Exact engine revision.
@@ -288,11 +289,14 @@ def run_prepared_model_evaluation(
             (runtime_input,),
             judging_protocol=judging_protocol,
             judging_input=judging_revision,
-            spending_limit_usd=budget.maximum_cost_usd,
+            # Every inference role shares the request ledger above. It enforces the
+            # operator cap before new dispatch; post-hoc service checks must not reject
+            # replay of already-paid evidence when that cap is lowered on resume.
+            spending_limit_usd=None,
             judge_spend=judge_spend,
         ),
-        # Semantic execution bounds stay frozen across allowance increases. The request
-        # ledger enforces the smaller approved amount before every paid dispatch.
+        # Semantic execution bounds stay frozen across allowance changes. The request
+        # ledger independently enforces an enabled aggregate cap before every paid dispatch.
         budget=budget.model_copy(update={"maximum_cost_usd": max(quote.maximum_cost_usd, 1e-12)}),
         created_at=created_at,
         code_revision=code_revision,

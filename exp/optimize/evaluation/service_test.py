@@ -46,6 +46,28 @@ class _Judge(_RouterTestJudge):
     model: ModelSnapshot = _snapshot("judge-model")
 
 
+def test_direct_evaluation_requires_a_finite_execution_envelope_before_side_effects(
+    tmp_path: Path,
+) -> None:
+    """The low-level API points uncapped callers to the catalog-backed envelope builder."""
+    project, setup = _prepared(tmp_path)
+    factory = _SimulatorFactory()
+    judge = _Judge()
+    before = project.artifacts.list_ids()
+    with pytest.raises(ValueError, match="run_prepared_model_evaluation.*maximum_cost_usd=None"):
+        evaluate_models(
+            project,
+            setup,
+            services=EvaluationServices(factory, judge, spending_limit_usd=None),
+            budget=EvaluationBudget(maximum_judgments=100),
+            created_at=_TIME,
+            code_revision="test-revision",
+        )
+    assert factory.log == []
+    assert judge.calls == 0
+    assert project.artifacts.list_ids() == before
+
+
 @pytest.mark.parametrize("concurrent_admission", [False, True])
 def test_evaluation_judgments_use_the_shared_concurrency_allowance_and_replay(
     tmp_path: Path,
@@ -134,7 +156,10 @@ def test_evaluation_judgments_use_the_shared_concurrency_allowance_and_replay(
     assert judge.calls == len(result.plan.cells)
 
 
-def test_undeclared_injected_judge_preserves_serial_spend_checks(tmp_path: Path) -> None:
+@pytest.mark.parametrize("uncapped", [False, True])
+def test_undeclared_injected_judge_preserves_serial_spend_checks(
+    tmp_path: Path, uncapped: bool
+) -> None:
     """An injected judge cannot multiply admitted spend merely because rollouts allow overlap."""
     project, setup = _prepared(tmp_path)
     setup = setup.model_copy(update={"maximum_concurrency": 8})
@@ -155,16 +180,32 @@ def test_undeclared_injected_judge_preserves_serial_spend_checks(tmp_path: Path)
             raise JudgeDispatchExhaustedError("provider exhausted", conservative_cost_usd=10)
 
     judge = ExhaustedJudge()
-    with pytest.raises(ValueError, match="shared ceiling"):
-        evaluate_models(
+    services = EvaluationServices(
+        simulator_factory=_SimulatorFactory(),
+        judge=judge,
+        spending_limit_usd=None if uncapped else "execution_budget",
+    )
+
+    def evaluate() -> ModelEvaluationReport:
+        """Distinguish an explicit null allowance from the default finite execution budget."""
+        return evaluate_models(
             project,
             setup,
-            services=EvaluationServices(simulator_factory=_SimulatorFactory(), judge=judge),
+            services=services,
             budget=EvaluationBudget(maximum_cost_usd=10, maximum_judgments=100),
             created_at=_TIME,
             code_revision="test-revision",
-        )
-    assert judge.calls == 1
+        ).report
+
+    if uncapped:
+        report = evaluate()
+        assert judge.calls > 1
+        assert report.compared_cells == 0
+        assert evaluate() == report
+    else:
+        with pytest.raises(ValueError, match="shared ceiling"):
+            evaluate()
+        assert judge.calls == 1
 
 
 class _UnavailableClient(_TargetedTransportFailureClient):
