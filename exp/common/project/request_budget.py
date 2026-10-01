@@ -1,25 +1,115 @@
 """Project-scoped provider receipts and accounting in the shared content database."""
 
+import json
 import math
 from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Literal, cast
 from uuid import uuid4
 
-from pydantic import Field
+from pydantic import Field, JsonValue
 
 from exp.common.core.artifacts import (
     ArtifactEnvelope,
     ArtifactInput,
     ContractModel,
+    SecretBoundaryError,
+    assert_key_secret_free,
+    assert_prose_secret_free,
+    assert_text_secret_free,
     canonical_json_bytes,
     stable_id,
 )
+from exp.common.project.errors import ArtifactStoreError
 from exp.common.project.manifests import artifact_input
 from exp.common.project.records import ProjectRecords
 from exp.common.project.store import ProjectStore
 from exp.common.release_revision import installed_release_revision
+
+
+class _Response(ContractModel):
+    """Exact encoded provider output retained as data rather than credential configuration.
+
+    Attributes:
+        payload: Original encoded response, without normalization or redaction.
+    """
+
+    payload: str
+
+
+def _validate_response(payload: str) -> None:
+    """Validate encoded output using its matching structured or plain-text boundary.
+
+    Args:
+        payload: Encoded response, which may be arbitrary text or serialized JSON.
+
+    Raises:
+        ArtifactStoreError: The response violates the credential boundary or decoder depth limit.
+    """
+    try:
+        try:
+            value = _response_json(payload)
+        except json.JSONDecodeError:
+            assert_text_secret_free(payload)
+        else:
+            _validate_response_values(value)
+    except SecretBoundaryError as exc:
+        raise ArtifactStoreError(
+            "provider response violates the secret boundary (credential-like content). "
+            "Remove credential-bearing fields, assignments, and secret values from the output, "
+            "then start a fresh evaluation. The rejected response was not saved."
+        ) from exc
+    except RecursionError as exc:
+        raise ArtifactStoreError(
+            "provider response exceeds the JSON nesting supported by the decoder. "
+            "Simplify the nested JSON output, then start a fresh evaluation. "
+            "The rejected response was not saved."
+        ) from exc
+
+
+def _response_object(pairs: list[tuple[str, JsonValue]]) -> dict[str, JsonValue]:
+    """Reject duplicate keys before parsing can discard any retained response content."""
+    value: dict[str, JsonValue] = {}
+    for key, nested in pairs:
+        if key in value:
+            raise ArtifactStoreError(
+                "provider response violates the secret boundary (duplicate JSON keys). "
+                "Remove duplicate keys from the encoded output, then start a fresh evaluation. "
+                "The rejected response was not saved."
+            )
+        value[key] = nested
+    return value
+
+
+def _response_json(payload: str) -> JsonValue:
+    """Decode fields and string content without discarding duplicate object members.
+
+    Integer literals stay as digit strings in this validation-only view, avoiding Python's
+    integer-conversion limit. Persistence retains the original response, including number types.
+    """
+    return cast(JsonValue, json.loads(payload, object_pairs_hook=_response_object, parse_int=str))
+
+
+def _validate_response_values(value: JsonValue) -> None:
+    """Check credential fields and assignments, including JSON encoded inside string leaves."""
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            for key, nested in current.items():
+                assert_key_secret_free(key)
+                pending.append(nested)
+        elif isinstance(current, list):
+            pending.extend(current)
+        elif isinstance(current, str):
+            assert_prose_secret_free(current)
+            try:
+                nested = _response_json(current)
+            except json.JSONDecodeError:
+                continue
+            if nested != current:
+                pending.append(nested)
 
 
 class RequestReceipt(ContractModel):
@@ -115,15 +205,16 @@ class RequestBudgetStore:
             previous = self.read(key)
             if previous is None or previous.state != "pending":
                 raise ValueError("provider request does not have a pending reservation")
+            _validate_response(payload)
             manifest = self._project.artifacts.write(
                 artifact_id=stable_id("request-response", {"budget": self._identity, "key": key}),
                 artifact_type="provider-response",
                 envelope=ArtifactEnvelope(
-                    schema_version=1,
+                    schema_version=2,
                     created_at=datetime.now(UTC),
                     code_revision=installed_release_revision(),
                 ),
-                files={"response.txt": payload.encode("utf-8")},
+                files={"response.json": canonical_json_bytes(_Response(payload=payload))},
             )
             self.write(
                 key,
@@ -154,6 +245,11 @@ class RequestBudgetStore:
         stored = self._project.artifacts.read(pointer.artifact_id)
         if artifact_input(stored.manifest) != pointer:
             raise ValueError("saved provider response identity changed")
-        return self._project.artifacts.read_bytes(pointer.artifact_id, "response.txt").decode(
-            "utf-8"
-        )
+        if stored.manifest.schema_version == 1:
+            return self._project.artifacts.read_bytes(pointer.artifact_id, "response.txt").decode(
+                "utf-8"
+            )
+        if stored.manifest.schema_version != 2:
+            raise ValueError("saved provider response schema is unsupported")
+        payload = self._project.artifacts.read_bytes(pointer.artifact_id, "response.json")
+        return _Response.model_validate_json(payload).payload
