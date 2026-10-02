@@ -35,12 +35,15 @@ from exp.runtime.models import ResolvedModel
 from exp.runtime.models.providers.openai import openai_responses_response
 from exp.runtime.models.providers.transport import ScriptedJsonTransport
 from exp.runtime.models.registry import RuntimeModelCatalog
+from exp.simulation.engines.text.prompt import build_world_model_request
 from exp.simulation.engines.text.recording import (
     RecordingCandidateClient,
     TextSimulationError,
     _require_response_identity,
 )
+from exp.simulation.engines.text.tokens import TokenCounter, Utf8UpperBoundTokenCounter
 from exp.simulation.retrieval import RAGMatch, RAGQuery, TraceRAGRetriever
+from exp.simulation.retrieval.contracts import RAGAction, RAGObservation, RAGTransition
 from exp.simulation.world_model import GroundedWorldModel, GroundedWorldModelArtifact
 from exp.simulation.world_model.artifact import (
     GROUNDED_WORLD_MODEL_PROMPT_VERSION,
@@ -61,9 +64,10 @@ class _ScriptedClient:
 
 
 class _Retriever:
-    def __init__(self) -> None:
+    def __init__(self, matches: tuple[RAGMatch, ...] = ()) -> None:
         """Initialize an empty ordered query log."""
         self.queries: list[RAGQuery] = []
+        self.matches = matches
 
     def estimate_query_economics(
         self,
@@ -84,24 +88,32 @@ class _Retriever:
         return OperationEconomics(cost_usd=NumericMeasurement(value=0.01, provenance="estimated"))
 
     def retrieve(self, query: RAGQuery) -> tuple[RAGMatch, ...]:
-        """Record a query and return no grounding examples.
+        """Record a query and return the configured whole grounding examples.
 
         Args:
             query: Canonical retrieval query dispatched by the recorder.
 
         Returns:
-            Empty deterministic result set.
+            Deterministic optional grounding examples.
         """
         self.queries.append(query)
-        return ()
+        return self.matches
 
 
-def _snapshot(name: str) -> ModelSnapshot:
+def _snapshot(
+    name: str,
+    *,
+    capabilities: ModelCapabilities | None = None,
+) -> ModelSnapshot:
+    """Freeze the exact declared capacity for a scripted provider response."""
+    capabilities = capabilities or ModelCapabilities(
+        context_window_tokens=100_000, maximum_output_tokens=16_000
+    )
     return ModelSnapshot(
         billing_source=BillingSource.CUSTOMER_MANAGED,
         provider="test",
         model_id=name,
-        capabilities_sha256="a" * 64,
+        capabilities_sha256=capabilities.identity_sha256(),
         connection_sha256="b" * 64,
     )
 
@@ -205,18 +217,19 @@ def _resolved(
     Returns:
         Exact scripted runtime model.
     """
+    capabilities = ModelCapabilities(
+        supports_completions=True if completion_pricing else None,
+        context_window_tokens=context_window_tokens,
+        maximum_output_tokens=output_limit,
+        input_cost_per_million_tokens_usd=input_price if completion_pricing else None,
+        output_cost_per_million_tokens_usd=2.0 if completion_pricing else None,
+        cached_input_cost_per_million_tokens_usd=0.5 if completion_pricing else None,
+        cache_write_cost_per_million_tokens_usd=1.5 if completion_pricing else None,
+    )
     return ResolvedModel(
         alias=alias,
-        snapshot=_snapshot(alias),
-        capabilities=ModelCapabilities(
-            supports_completions=True if completion_pricing else None,
-            context_window_tokens=context_window_tokens,
-            maximum_output_tokens=output_limit,
-            input_cost_per_million_tokens_usd=input_price if completion_pricing else None,
-            output_cost_per_million_tokens_usd=2.0 if completion_pricing else None,
-            cached_input_cost_per_million_tokens_usd=0.5 if completion_pricing else None,
-            cache_write_cost_per_million_tokens_usd=1.5 if completion_pricing else None,
-        ),
+        snapshot=_snapshot(alias, capabilities=capabilities),
+        capabilities=capabilities,
         client=client,
         embedding_client=None,
     )
@@ -241,6 +254,9 @@ def _recorder(
     maximum_transition_attempts: int = 1,
     task: TaskCase | None = None,
     world_context_window: int = 100_000,
+    retrieval_matches: tuple[RAGMatch, ...] = (),
+    token_counter: TokenCounter | None = None,
+    grounded_world_model: GroundedWorldModel | None = None,
 ) -> RecordingCandidateClient:
     """Build a recorder with explicit fake candidate, world model, and retriever.
 
@@ -260,6 +276,9 @@ def _recorder(
         maximum_transition_attempts: Permitted simulator replies for the same candidate turn.
         task: Optional task carrying declared tools for observation-boundary tests.
         world_context_window: Exact world-model context ceiling for retry admission tests.
+        retrieval_matches: Whole observed examples returned by the scripted retriever.
+        token_counter: Optional request counter owned by this recording session.
+        grounded_world_model: Optional shared executor whose counter may differ from the recorder.
 
     Returns:
         Recorder configured for one deterministic task.
@@ -274,7 +293,7 @@ def _recorder(
     )
     if candidate_served_model_id is not None:
         candidate = replace(candidate, served_model_id=candidate_served_model_id)
-    retriever = cast(TraceRAGRetriever, _Retriever())
+    retriever = cast(TraceRAGRetriever, _Retriever(retrieval_matches))
     serving_input = ArtifactInput(artifact_id="serving-rag", sha256="c" * 64)
     world_model = _resolved(
         "world-model-a",
@@ -283,7 +302,7 @@ def _recorder(
         completion_pricing=world_request is not None,
         output_limit=output_limit,
     )
-    grounded = GroundedWorldModel(
+    grounded = grounded_world_model or GroundedWorldModel(
         artifact_input=ArtifactInput(artifact_id="grounded-world-model", sha256="d" * 64),
         artifact=GroundedWorldModelArtifact(
             schema_version=1,
@@ -300,6 +319,7 @@ def _recorder(
         ),
         retriever=retriever,
         client=world_client,
+        capabilities=world_model.capabilities,
     )
     return RecordingCandidateClient(
         task=task or _task(),
@@ -324,12 +344,16 @@ def _recorder(
         maximum_transition_attempts=maximum_transition_attempts,
         redacted_field_names=frozenset(),
         clock=lambda: _TIME,
-        token_counter=_Utf8Counter(),
+        token_counter=token_counter or _Utf8Counter(),
     )
 
 
 def _completion_reservation(
-    alias: str, *, maximum_input_tokens: int = 80_000, maximum_output_tokens: int = 16_000
+    alias: str,
+    *,
+    maximum_input_tokens: int = 80_000,
+    maximum_output_tokens: int = 16_000,
+    capabilities: ModelCapabilities | None = None,
 ) -> CompletionCostReservation:
     """Return a complete one-attempt request reservation for a scripted alias.
 
@@ -337,12 +361,13 @@ def _completion_reservation(
         alias: Exact candidate or world-model alias.
         maximum_input_tokens: Full request input ceiling.
         maximum_output_tokens: Finite request output budget.
+        capabilities: Exact provider capacity metadata frozen into the reservation identity.
 
     Returns:
         Conservative completion request reservation.
     """
     return completion_cost_reservation(
-        model=_snapshot(alias),
+        model=_snapshot(alias, capabilities=capabilities),
         input_usd_per_million_tokens=1,
         output_usd_per_million_tokens=2,
         cached_input_usd_per_million_tokens=0.5,
@@ -356,6 +381,177 @@ def _completion_reservation(
 class _Utf8Counter:
     def count(self, request: ModelRequest) -> int:
         return len(request.model_dump_json().encode("utf-8"))
+
+
+def _grounding_example(identifier: str, size: int) -> RAGMatch:
+    """Create a complete observed transition with a controllable optional payload size."""
+    return RAGMatch(
+        score=1.0,
+        transition=RAGTransition(
+            transition_id=identifier,
+            trace_id=f"trace-{identifier}",
+            lineage_id=f"lineage-{identifier}",
+            action_span_id="action",
+            observation_span_id="observation",
+            task="Observed request",
+            initial_context={"original": True},
+            action=RAGAction(kind="message", content="Observed action"),
+            observation=RAGObservation(kind="message", content="é" * size),
+            key_text="observed-key",
+            key_sha256="f" * 64,
+        ),
+    )
+
+
+def test_recorder_uses_one_injected_counter_without_mutating_the_shared_executor() -> None:
+    """Counter ownership preserves the actually dispatched grounding and its recorded provenance."""
+
+    class FixtureTokenizer:
+        """Count four encoded bytes per fixture token instead of the default upper bound."""
+
+        def count(self, request: ModelRequest) -> int:
+            """Return the deterministic request count used for both admission passes."""
+            return (len(request.model_dump_json().encode("utf-8")) + 3) // 4
+
+    candidate = _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient(
+        [
+            _response(
+                '{"message":"","terminal":true}',
+                model=_snapshot(
+                    "world-model-a",
+                    capabilities=ModelCapabilities(
+                        context_window_tokens=24_000, maximum_output_tokens=16_000
+                    ),
+                ),
+            ),
+        ]
+    )
+    matches = (_grounding_example("larger", 6_000), _grounding_example("small", 50))
+    original = _recorder(
+        candidate, world, world_context_window=24_000, retrieval_matches=matches
+    )._grounded_world_model
+    original_counter = original.token_counter
+    counter = FixtureTokenizer()
+    recorder = _recorder(
+        candidate,
+        world,
+        world_context_window=24_000,
+        token_counter=counter,
+        grounded_world_model=original,
+    )
+    recorder.complete(ModelRequest(messages=(ModelMessage(role="user", content="Question"),)))
+    sent = world.requests[0]
+    evidence = json.loads(sent.messages[1].content or "")
+    included = tuple(item["transition_id"] for item in evidence["grounded_examples"])
+    assert included == ("larger", "small")
+    assert recorder.recorded.retrieved_transition_ids == (included,)
+    assert counter.count(sent) + 16_000 <= 24_000
+    assert original_counter.count(sent) + 16_000 > 24_000
+    assert sent.maximum_output_tokens == 16_000
+    assert recorder._grounded_world_model.token_counter is counter
+    assert recorder._grounded_world_model is not original
+    assert original.token_counter is original_counter
+    assert recorder._grounded_world_model.artifact is original.artifact
+    assert recorder._grounded_world_model.client is original.client
+    assert recorder._grounded_world_model.retriever is original.retriever
+
+
+def test_world_context_packs_whole_examples_and_records_only_dispatched_grounding() -> None:
+    """An oversized optional example must not invalidate a required prompt that fits."""
+    candidate = _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient(
+        [
+            _response(
+                "bad",
+                model=_snapshot(
+                    "world-model-a",
+                    capabilities=ModelCapabilities(
+                        context_window_tokens=24_000, maximum_output_tokens=16_000
+                    ),
+                ),
+            ),
+            _response(
+                '{"message":"","terminal":true}',
+                model=_snapshot(
+                    "world-model-a",
+                    capabilities=ModelCapabilities(
+                        context_window_tokens=24_000, maximum_output_tokens=16_000
+                    ),
+                ),
+            ),
+        ]
+    )
+    recorder = _recorder(
+        candidate,
+        world,
+        maximum_transition_attempts=2,
+        world_context_window=24_000,
+        retrieval_matches=(_grounding_example("oversized", 30_000), _grounding_example("fits", 50)),
+        world_model_json_object_output=True,
+    )
+    request = ModelRequest(messages=(ModelMessage(role="user", content="Required question"),))
+    recorder.complete(request)
+
+    assert len(candidate.requests) == 1
+    assert len(world.requests) == 2
+    for sent in world.requests:
+        evidence = json.loads(sent.messages[1].content or "")
+        assert [example["transition_id"] for example in evidence["grounded_examples"]] == ["fits"]
+        assert evidence["task"]["instruction"] == _task().instruction
+        assert evidence["task"]["initial_context"] == _task().initial_context
+        assert evidence["visible_conversation"][0]["content"] == "Required question"
+        assert evidence["candidate_response"]["content"] == "answer"
+        assert evidence["environment_state"] == {}
+        assert sent.maximum_output_tokens == 16_000
+        assert sent.json_object_output
+        assert _Utf8Counter().count(sent) + sent.maximum_output_tokens <= 24_000
+    assert "invalid" in (world.requests[1].messages[-1].content or "")
+    assert recorder.recorded.retrieved_transition_ids == (("fits",), ("fits",))
+
+
+def test_unpublished_world_output_packs_examples_before_binding_output() -> None:
+    """Optional grounding must not consume the requested output when no hard max is published."""
+    candidate = _ScriptedClient(
+        [
+            _response(
+                "answer",
+                model=_snapshot(
+                    "candidate-a", capabilities=ModelCapabilities(context_window_tokens=100_000)
+                ),
+            )
+        ]
+    )
+    world = _ScriptedClient(
+        [
+            _response(
+                '{"message":"","terminal":true}',
+                model=_snapshot(
+                    "world-model-a", capabilities=ModelCapabilities(context_window_tokens=24_000)
+                ),
+            )
+        ]
+    )
+    recorder = _recorder(
+        candidate,
+        world,
+        output_limit=None,
+        world_context_window=24_000,
+        retrieval_matches=(
+            _grounding_example("too-large-with-output", 6_000),
+            _grounding_example("fits", 50),
+        ),
+    )
+    recorder.complete(
+        ModelRequest(messages=(ModelMessage(role="user", content="Required question"),))
+    )
+
+    request = world.requests[0]
+    evidence = json.loads(request.messages[1].content or "")
+    assert [item["transition_id"] for item in evidence["grounded_examples"]] == ["fits"]
+    assert request.maximum_output_tokens == 16_000
+    assert _Utf8Counter().count(request) + 16_000 <= 24_000
+    assert recorder.recorded.retrieved_transition_ids == (("fits",),)
 
 
 @pytest.mark.parametrize("json_output", [False, True])
@@ -645,7 +841,12 @@ def test_recorder_fails_context_preflight_and_explicit_length_stops_without_trun
     assert overflow_error.value.stop_reason == StopReason.CONTEXT_OVERFLOW
     assert candidate_client.requests == []
 
-    candidate_snapshot = _snapshot("candidate-a")
+    candidate_snapshot = _snapshot(
+        "candidate-a",
+        capabilities=ModelCapabilities(
+            context_window_tokens=100_000, maximum_output_tokens=output_limit
+        ),
+    )
     length_client = _ScriptedClient(
         [
             _response(
@@ -668,11 +869,64 @@ def test_recorder_fails_context_preflight_and_explicit_length_stops_without_trun
     }
 
 
+@pytest.mark.parametrize("boundary", ["required_content", "json_framing", "frozen_input"])
+def test_required_world_preflight_retains_candidate_without_claiming_retrieval_spend(
+    boundary: str,
+) -> None:
+    """Known required-input failures precede embedding admission and retain prior paid evidence."""
+    candidate = _ScriptedClient([_response("answer", model=_snapshot("candidate-a"))])
+    world = _ScriptedClient([])
+    request = ModelRequest(messages=(ModelMessage(role="user", content="Complete the task."),))
+    counter = Utf8UpperBoundTokenCounter()
+    required = build_world_model_request(
+        _task(),
+        visible_messages=request.messages,
+        candidate_response=AssistantAction(content="answer"),
+        grounded_examples=(),
+        maximum_output_tokens=16_000,
+        state={},
+    )
+    input_count = counter.count(required)
+    context = input_count + 16_000 if boundary == "json_framing" else 100_000
+    if boundary == "required_content":
+        context = input_count + 15_999
+    reservation = (
+        _completion_reservation("world-model-a", maximum_input_tokens=input_count - 1)
+        if boundary == "frozen_input"
+        else None
+    )
+    recorder = _recorder(
+        candidate,
+        world,
+        world_context_window=context,
+        world_model_json_object_output=boundary == "json_framing",
+        world_request=reservation,
+        token_counter=counter,
+    )
+    retriever = cast(_Retriever, recorder._grounded_world_model.retriever)
+    with pytest.raises(TextSimulationError) as raised:
+        recorder.complete(request)
+    assert raised.value.stop_reason == StopReason.CONTEXT_OVERFLOW
+    assert not raised.value.failure.details.get("provider_dispatch_unknown_spend", False)
+    assert retriever.queries == []
+    assert world.requests == []
+    assert len(candidate.requests) == len(recorder.recorded.candidate_spans) == 1
+    assert recorder.recorded.candidate_economics.cost_usd == NumericMeasurement(
+        value=0.10, provenance="observed"
+    )
+    assert recorder.recorded.retrieval_economics == OperationEconomics()
+    assert recorder.recorded.world_model_spans == ()
+
+
 def test_unpublished_output_limits_dispatch_full_requests_within_context_and_reservations() -> None:
     """Both completion roles work without an invented provider limit and keep exact inputs."""
+    candidate_capabilities = ModelCapabilities(context_window_tokens=10_000)
+    world_capabilities = ModelCapabilities(context_window_tokens=100_000)
     candidate = _ScriptedClient(
         [
-            _response("Done.", model=_snapshot("candidate-a")).model_copy(
+            _response(
+                "Done.", model=_snapshot("candidate-a", capabilities=candidate_capabilities)
+            ).model_copy(
                 update={
                     "economics": OperationEconomics(usage=Usage(input_tokens=4, output_tokens=3))
                 }
@@ -680,7 +934,12 @@ def test_unpublished_output_limits_dispatch_full_requests_within_context_and_res
         ]
     )
     world = _ScriptedClient(
-        [_response('{"message":"Done.","terminal":true}', model=_snapshot("world-model-a"))]
+        [
+            _response(
+                '{"message":"Done.","terminal":true}',
+                model=_snapshot("world-model-a", capabilities=world_capabilities),
+            )
+        ]
     )
     recorder = _recorder(
         candidate,
@@ -688,9 +947,14 @@ def test_unpublished_output_limits_dispatch_full_requests_within_context_and_res
         candidate_context_window=10_000,
         output_limit=None,
         candidate_request=_completion_reservation(
-            "candidate-a", maximum_input_tokens=10_000, maximum_output_tokens=10_000
+            "candidate-a",
+            maximum_input_tokens=10_000,
+            maximum_output_tokens=10_000,
+            capabilities=candidate_capabilities,
         ),
-        world_request=_completion_reservation("world-model-a", maximum_input_tokens=100_000),
+        world_request=_completion_reservation(
+            "world-model-a", maximum_input_tokens=100_000, capabilities=world_capabilities
+        ),
     )
     request = ModelRequest(messages=(ModelMessage(role="user", content="Complete the task."),))
     recorder.complete(request)
@@ -1034,10 +1298,17 @@ def test_world_retry_without_feedback_room_reuses_full_original_request(limited_
     with pytest.raises(TextSimulationError):
         baseline.complete(request)
     input_tokens = _Utf8Counter().count(baseline_world.requests[0])
+    world_context = input_tokens + 16_000 if limited_by == "context" else 100_000
+    world_snapshot = _snapshot(
+        "world-model-a",
+        capabilities=ModelCapabilities(
+            context_window_tokens=world_context, maximum_output_tokens=16_000
+        ),
+    )
     world = _ScriptedClient(
         [
-            invalid,
-            _response('{"message":"","terminal":true}', model=_snapshot("world-model-a")),
+            invalid.model_copy(update={"model": world_snapshot}),
+            _response('{"message":"","terminal":true}', model=world_snapshot),
         ]
     )
     world.responses = [
@@ -1055,7 +1326,7 @@ def test_world_retry_without_feedback_room_reuses_full_original_request(limited_
         candidate,
         world,
         maximum_transition_attempts=3,
-        world_context_window=input_tokens + 16_000 if limited_by == "context" else 100_000,
+        world_context_window=world_context,
         world_request=_completion_reservation("world-model-a", maximum_input_tokens=input_tokens)
         if limited_by == "reservation"
         else None,
