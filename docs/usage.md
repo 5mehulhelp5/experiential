@@ -334,7 +334,7 @@ identity authorization and job persistence remain hosting responsibilities.
 
 Catalog-backed evaluations and `exp eval` have no aggregate spending limit by default. The
 estimate remains visible and uncapped execution requires an explicit Start action or `--yes`.
-Every request keeps a finite token and retry-inclusive cost
+Every request keeps finite token bounds and a retry-inclusive cost
 reservation; completed charges, unknown-dispatch holds and exact response replay remain durable
 with or without an aggregate cap. In the launch review, select Spending limit to set a positive
 dollar amount or enter `none` to remove it. Changing that limit does not change the frozen plan.
@@ -501,3 +501,39 @@ shared valid cohort; invalid/incomplete coverage and total experiment spend rema
 Assistant cost per task reprices recorded successful-rollout tokens at the frozen catalog rates.
 It excludes simulation, judging, invalid attempts, and hypothetical retry reservations.
 Conservative experiment-spend accounting remains separate from the report's operating cost.
+
+When a catalog model carries `gateway.prices`, preparation freezes the complete
+`GatewayTokenPrices` in its request reservations and `CandidateTokenPrice.token_prices`.
+Gateway metadata containing only capabilities leaves the model's existing flat rates in use.
+An explicitly supplied empty price card instead declares unknown pricing and cannot be replaced
+by those flat rates. Saving and reloading the catalog preserves this distinction.
+Long-context thresholds apply to each request's original input total, never to the sum of a
+rollout's calls. Cache reads and writes remain disjoint input subsets; reasoning remains an
+output subset. Launch estimates also price each captured request before averaging source
+episodes. Explicitly returned service tiers select their authored schedule. When no tier
+is returned, valuation uses the ordinary request contract. Native gateway relays currently do
+not preserve returned service-tier metadata, so their reports cannot establish a different tier.
+`ModelRequest` cannot select flex or priority, so its estimates and finite admission checks use
+the ordinary schedule and reachable long-context tier. The other authored cards remain frozen
+for actual returned-tier valuation. Judging retries retain the original complete judge card.
+These frozen attribution rates are separate from provider invoices, account discounts, and any
+gateway debit. Current four-rate and full-schedule requests use the same wrapped response
+contract. Receipts from a different response contract remain untouched and fail before dispatch;
+create a fresh preparation instead of rebinding saved requests.
+
+Unknown meters remain distinct from measured zero. Missing subset counts are priceable only
+when every possible allocation has the same authored rate. A positive cache-write total with
+no one-hour split is priceable only when both write rates are known and equal. No rate or meter
+is inferred from a provider name. A missing applicable rate makes the quote's
+`maximum_is_upper_bound` false; an aggregate cap cannot authorize that request. Uncapped
+execution still saves paid responses and unknown liability before surfacing a valuation error.
+Prepared evaluation with a finite cap rejects any incomplete stage before constructing provider
+clients. Replaying a preparation with incomplete tariffs requires uncapped mode; saved receipts
+remain untouched. Automatic and hosted router optimization require a finite allowance and reject
+an incomplete candidate, world, or judge tariff during planning.
+A priceable successful response cannot settle unbounded
+liability from earlier potentially paid retries; certified unpaid attempts do not add liability.
+Request-receipt replay returns the saved result or pricing error without another call, including
+after the operator adds a lower cap. Online routed accounting retains an unknown total when
+the final reply cannot account for earlier potentially paid attempts, preserving the original
+response beside that total. Unpriceable assistant usage cannot create a known report cost.

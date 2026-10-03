@@ -224,11 +224,14 @@ impl Normalizer {
     }
 
     /// Whether the latest normalized meter replaces earlier ones instead of
-    /// merging by maximum. A writes-within-reads accumulator already coalesces
-    /// every report and lowers the read leg once a write arrives, so a
-    /// max-merge would restore the read tokens it moved to the write leg.
+    /// merging by maximum. OpenAI accumulators already coalesce raw reports;
+    /// normalized counts can decrease when reasoning evidence becomes decisive
+    /// or cache writes move tokens out of the overlapping read leg.
     pub(crate) fn meter_replaces_earlier(&self) -> bool {
-        self.openai_usage.writes_within_reads()
+        matches!(
+            self.dialect,
+            Dialect::OpenAiCompatible | Dialect::OpenAiResponses
+        )
     }
 
     /// Classify a provider failure and retain bounded detail; exact relay verdicts
@@ -436,7 +439,7 @@ pub struct Normalizer {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     cache_read: u64,
-    cache_write: u64,
+    cache_write: Option<u64>,
     cache_write_1h: Option<u64>,
     stop_reason: Option<String>,
     // OpenAI-compatible and Gemini accumulation.
@@ -508,7 +511,7 @@ impl Normalizer {
             input_tokens: None,
             output_tokens: None,
             cache_read: 0,
-            cache_write: 0,
+            cache_write: None,
             cache_write_1h: None,
             stop_reason: None,
             usage: None,
